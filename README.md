@@ -1,0 +1,2 @@
+# Induction-Motor-Fault-Diagnosis-using-Convolutional-Neural-Networks-A-Physics-Aware-Approach
+Induction motors are vital to industrial machinery, making fault detection essential. This paper presents an automated MCSA-based deep learning system using MATLAB Simulink, STFT spectrograms, and CNNs to classify six motor conditions. Trained on 3,000 simulations, the model achieved 98.1% test accuracy.
