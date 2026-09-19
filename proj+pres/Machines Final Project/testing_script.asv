@@ -1,0 +1,150 @@
+%% ===== TEST SINGLE FAULT FROM WORKSPACE (STEADY STATE ONLY) =====
+% Loads a trained ResNet-50 model and predicts the fault for a single
+% set of current variables (Ia, Ib, Ic) currently in the workspace.
+% Uses ONLY data after 1.0 second to avoid startup transients.
+% After generating a few images, load and analyze them
+%% 1. User Inputs (Update Variable Names Here)
+try
+    data_Ia = Ia_2; 
+    data_Ib = Ib_2;
+    data_Ic = Ic_2;
+catch
+    error('Variables Ia, Ib, or Ic not found in workspace. Please rename them in the script.');
+end
+
+model_file = 'cnn_trained_model4_100percent_accuracy_golden.mat'; % Ensure this matches your saved model name
+
+%% 2. Configuration (Must Match Training exactly)
+Fs = 1000;
+window_size = 30000;      % 3s
+spec.window = 2048;      % MATCH YOUR TRAINING SCRIPT
+spec.noverlap = 1536;     % MATCH YOUR TRAINING SCRIPT
+spec.nfft = 4096;        % MATCH YOUR TRAINING SCRIPT
+img_size = [224, 224];
+transient_samples = 10000; % 1.0 second at 10kHz
+
+% *** ADDED: Noise parameter to match training ***
+noise_std_frac = 0.01;   
+
+%% 3. Load Model
+if ~exist(model_file, 'file')
+    error('Model file %s not found. Run the training script first.', model_file);
+end
+fprintf('Loading model: %s ...\n', model_file);
+load(model_file, 'netTransfer', 'class_labels');
+
+%% 4. Preprocess Signal (CUT TRANSIENT LOGIC)
+% Ensure column vectors
+data_Ia = data_Ia(:);
+data_Ib = data_Ib(:);
+data_Ic = data_Ic(:);
+
+L = length(data_Ia);
+fprintf('Signal Length: %d samples\n', L);
+
+% Logic: We want the LAST 4000 samples, provided they are after t=1.0s
+if L > (transient_samples + window_size)
+    % Case A: Long signal (e.g. 3s). Take the LAST window to be safe.
+    fprintf('Cutting signal to use steady-state data (after 1.0s)...\n');
+    start_idx = L - window_size + 1;
+    
+    Ia_win = data_Ia(start_idx : end);
+    Ib_win = data_Ib(start_idx : end);
+    Ic_win = data_Ic(start_idx : end);
+    
+elseif L >= window_size
+    % Case B: Signal is short (e.g. exactly 0.4s) but user says it's steady.
+    % We just take the last available window.
+    warning('Signal is short. Using the last %.2fs of data available.', window_size/Fs);
+    start_idx = L - window_size + 1;
+    
+    Ia_win = data_Ia(start_idx : end);
+    Ib_win = data_Ib(start_idx : end);
+    Ic_win = data_Ic(start_idx : end);
+    
+else
+    % Case C: Too short. Must pad (Not ideal for testing, but prevents crash).
+    pad_len = window_size - L;
+    Ia_win = [data_Ia; zeros(pad_len, 1)];
+    Ib_win = [data_Ib; zeros(pad_len, 1)];
+    Ic_win = [data_Ic; zeros(pad_len, 1)];
+    warning('Signal is shorter than window size. Padding with zeros.');
+end
+
+% *** ADDED: Apply Noise to match Training Conditions ***
+% This prevents the "perfect signal" mismatch issue
+fprintf('Applying noise matching training data (std_frac=%.2f)...\n', noise_std_frac);
+sstd = noise_std_frac * median([std(Ia_win), std(Ib_win), std(Ic_win)]);
+if sstd > 0
+    Ia_win = Ia_win + sstd * randn(size(Ia_win));
+    Ib_win = Ib_win + sstd * randn(size(Ib_win));
+    Ic_win = Ic_win + sstd * randn(size(Ic_win));
+end
+
+%% 5. Generate Spectrogram Image
+fprintf('Generating spectrogram...\n');
+img = create_spectrogram_local(Ia_win, Ib_win, Ic_win, Fs, img_size, spec.window, spec.noverlap, spec.nfft);
+
+%% 6. Predict
+fprintf('Classifying...\n');
+[prediction, scores] = classify(netTransfer, img);
+
+%% 7. Display Results
+fprintf('\n--------------------------------------\n');
+fprintf('PREDICTED FAULT: %s\n', string(prediction));
+fprintf('Confidence:      %.2f%%\n', max(scores)*100);
+fprintf('--------------------------------------\n');
+
+
+function img = create_spectrogram_local(Ia, Ib, Ic, Fs_target, img_size, window, noverlap, nfft)
+    % 1. DOWNSAMPLE (Zoom in to 1000 Hz)
+    downsample_factor = 10; 
+    try
+        Ia_low = decimate(double(Ia), downsample_factor);
+        Ib_low = decimate(double(Ib), downsample_factor);
+        Ic_low = decimate(double(Ic), downsample_factor);
+    catch
+        Ia_low = Ia(1:downsample_factor:end);
+        Ib_low = Ib(1:downsample_factor:end);
+        Ic_low = Ic(1:downsample_factor:end);
+    end
+    
+    rgb_img = zeros([img_size 3], 'uint8');
+    phases = {Ia_low, Ib_low, Ic_low};
+    
+    % --- Pass 1: Find Global Max ---
+    S_db_all = [];
+    for ch = 1:3
+        [S, F, ~] = spectrogram(phases{ch}(:), window, noverlap, nfft, Fs_target);
+        
+        % Crop to 0-400 Hz (Keep 7th Harmonic, cut high freq noise)
+        valid_idx = find(F >= 0 & F <= 400); 
+        S = S(valid_idx, :);
+        
+        S_db_all = [S_db_all; 10*log10(abs(S) + eps)]; 
+    end
+    
+    % --- THE FIX: FIXED DYNAMIC RANGE ---
+    % Instead of using the real minimum (which is random noise), 
+    % we enforce a 50dB "floor" below the peak.
+    
+    Smax = max(S_db_all(:));  % The peak (usually the 50Hz fundamental)
+    Smin = Smax - 50;         % The Floor: Drop everything below -50dB relative to peak
+    
+    % --- Pass 2: Generate Image ---
+    for ch = 1:3
+        [S, F, ~] = spectrogram(phases{ch}(:), window, noverlap, nfft, Fs_target);
+        valid_idx = find(F >= 0 & F <= 400);
+        S = S(valid_idx, :);
+        S_db = 10*log10(abs(S) + eps);
+        
+        % CLAMP THE DATA: Force quiet noise to be perfectly black
+        S_db(S_db < Smin) = Smin;
+        
+        % Normalize
+        S_norm = (S_db - Smin) / (Smax - Smin);
+        S_resized = imresize(S_norm, img_size);
+        rgb_img(:,:,ch) = uint8(S_resized * 255);
+    end
+    img = rgb_img;
+end
